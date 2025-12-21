@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""
+Script to add environment variables as GitHub Secrets using GitHub API.
+Reads from .env file and creates secrets in the specified repository.
+"""
+
+import os
+import sys
+import subprocess
+import json
+from pathlib import Path
+from typing import Dict, Tuple
+
+
+def read_env_file(env_file: str = ".env") -> Dict[str, str]:
+    """
+    Read environment variables from an .env file.
+    
+    Args:
+        env_file: Path to the .env file (default: .env)
+    
+    Returns:
+        Dictionary of environment variables
+    """
+    env_vars = {}
+    
+    if not Path(env_file).exists():
+        print(f"Error: {env_file} file not found")
+        return env_vars
+    
+    try:
+        with open(env_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                # Skip empty lines and comments
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Parse KEY=VALUE format
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    
+                    # Remove quotes if present
+                    if value.startswith('"') and value.endswith('"'):
+                        value = value[1:-1]
+                    elif value.startswith("'") and value.endswith("'"):
+                        value = value[1:-1]
+                    
+                    env_vars[key] = value
+    except Exception as e:
+        print(f"Error reading {env_file}: {e}")
+        return {}
+    
+    return env_vars
+
+
+def get_gh_credentials() -> Tuple[str, str, str]:
+    """
+    Get GitHub credentials and repository information.
+    
+    Returns:
+        Tuple of (owner, repo, token)
+    """
+    owner = os.getenv('GH_OWNER', 'Alekseyfdx')
+    repo = os.getenv('GH_REPO', 'test-pipline')
+    token = os.getenv('GH_TOKEN')
+    
+    if not token:
+        print("Error: GH_TOKEN environment variable not set")
+        print("Please set GH_TOKEN with your GitHub personal access token")
+        sys.exit(1)
+    
+    return owner, repo, token
+
+
+def get_public_key(owner: str, repo: str, token: str) -> Tuple[str, str]:
+    """
+    Get the public key for the repository to encrypt secrets.
+    
+    Args:
+        owner: Repository owner
+        repo: Repository name
+        token: GitHub API token
+    
+    Returns:
+        Tuple of (key_id, public_key)
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/public-key"
+    
+    result = subprocess.run(
+        ["curl", "-s", "-H", f"Authorization: token {token}", url],
+        capture_output=True,
+        text=True
+    )
+    
+    try:
+        data = json.loads(result.stdout)
+        if 'errors' in data or 'message' in data:
+            print(f"Error getting public key: {data.get('message', data)}")
+            sys.exit(1)
+        return data['key_id'], data['key']
+    except json.JSONDecodeError as e:
+        print(f"Error parsing public key response: {e}")
+        print(f"Response: {result.stdout}")
+        sys.exit(1)
+
+
+def encrypt_secret(public_key: str, secret_value: str) -> str:
+    """
+    Encrypt a secret using the repository's public key (using sodium).
+    
+    Args:
+        public_key: Base64 encoded public key
+        secret_value: The secret value to encrypt
+    
+    Returns:
+        Base64 encoded encrypted secret
+    """
+    try:
+        import base64
+        from nacl import utils, public
+        
+        # Decode the public key
+        public_key_bytes = base64.b64decode(public_key)
+        public_key_obj = public.PublicKey(public_key_bytes)
+        
+        # Encrypt the secret
+        secret_bytes = secret_value.encode('utf-8')
+        encrypted = public.SealedBox(public_key_obj).encrypt(secret_bytes)
+        
+        # Return base64 encoded encrypted secret
+        return base64.b64encode(encrypted.ciphertext).decode('utf-8')
+    except ImportError:
+        print("Error: PyNaCl is required for secret encryption")
+        print("Install it with: pip install pynacl")
+        sys.exit(1)
+
+
+def create_secret(owner: str, repo: str, token: str, secret_name: str, 
+                  secret_value: str, key_id: str, encrypted_value: str) -> bool:
+    """
+    Create a GitHub Secret using the API.
+    
+    Args:
+        owner: Repository owner
+        repo: Repository name
+        token: GitHub API token
+        secret_name: Name of the secret
+        secret_value: Value of the secret
+        key_id: Public key ID
+        encrypted_value: Encrypted secret value
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/{secret_name}"
+    
+    payload = {
+        "encrypted_value": encrypted_value,
+        "key_id": key_id
+    }
+    
+    result = subprocess.run(
+        ["curl", "-s", "-X", "PUT", 
+         "-H", f"Authorization: token {token}",
+         "-H", "Content-Type: application/json",
+         "-d", json.dumps(payload),
+         url],
+        capture_output=True,
+        text=True
+    )
+    
+    # GitHub API returns 201 for creation, 204 for update
+    if result.returncode == 0:
+        print(f"✓ Secret '{secret_name}' created/updated successfully")
+        return True
+    else:
+        print(f"✗ Failed to create secret '{secret_name}'")
+        print(f"  Response: {result.stdout}")
+        return False
+
+
+def main():
+    """Main function to orchestrate secret creation."""
+    print("GitHub Secrets Manager")
+    print("=" * 50)
+    
+    # Read environment variables
+    env_file = ".env"
+    if len(sys.argv) > 1:
+        env_file = sys.argv[1]
+    
+    print(f"\nReading environment variables from: {env_file}")
+    env_vars = read_env_file(env_file)
+    
+    if not env_vars:
+        print("No environment variables found or file is empty")
+        sys.exit(1)
+    
+    print(f"Found {len(env_vars)} environment variable(s)")
+    
+    # Get credentials
+    owner, repo, token = get_gh_credentials()
+    print(f"\nTarget repository: {owner}/{repo}")
+    
+    # Get public key for encryption
+    print("\nFetching repository public key...")
+    key_id, public_key = get_public_key(owner, repo, token)
+    print(f"Public key ID: {key_id}")
+    
+    # Create each secret
+    print(f"\nCreating {len(env_vars)} secret(s)...")
+    print("-" * 50)
+    
+    success_count = 0
+    for secret_name, secret_value in env_vars.items():
+        # Encrypt the secret
+        encrypted_value = encrypt_secret(public_key, secret_value)
+        
+        # Create the secret
+        if create_secret(owner, repo, token, secret_name, secret_value, 
+                        key_id, encrypted_value):
+            success_count += 1
+    
+    # Summary
+    print("-" * 50)
+    print(f"\nSummary: {success_count}/{len(env_vars)} secret(s) created successfully")
+    
+    if success_count == len(env_vars):
+        print("All secrets created successfully! ✓")
+        return 0
+    else:
+        print(f"Failed to create {len(env_vars) - success_count} secret(s)")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
