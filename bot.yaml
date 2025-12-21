@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-Script to add environment variables as GitHub Secrets using GitHub API.
-Reads from .env file and creates secrets in the specified repository.
-"""
-
 import os
 import sys
 import subprocess
